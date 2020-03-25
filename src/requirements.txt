@@ -1,0 +1,16 @@
+requests
+numpy
+pandas
+loguru
+lxml
+imageio
+selenium
+unidecode
+
+# for AWS/S3
+boto3
+
+# for google sheets
+google-api-python-client
+google-auth-httplib2 
+google-auth-oauthlib

@@ -1,3 +1,5 @@
+# OBSOLETE
+
 import os
 from loguru import logger
 from typing import List
@@ -6,9 +8,9 @@ from unidecode import unidecode
 import re
 from copy import deepcopy
 
-from directory_cache import DirectoryCache
-from content_table import ContentTable
-from change_list import ChangeList
+from shared.directory_cache import DirectoryCache
+from transform.content_table import ContentTable
+from transform.change_list import ChangeList
 
 class PageParser():
 
@@ -138,7 +140,7 @@ class PageParser():
             if x in ignore_list: continue
 
             logger.info(f"=================| {fn}")
-            content = self.cache.load(fn)
+            content = self.cache.read(fn)
 
             tree = html.fromstring(content)
             tables = tree.xpath('//table')

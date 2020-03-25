@@ -1,66 +1,27 @@
-import re
-import requests
 import os
-import io
-import shutil
-from loguru import logger
-from selenium import webdriver
-from selenium.webdriver.support.wait import WebDriverWait
-
-from typing import Callable
-from datetime import datetime, timezone
-
-import numpy as np
 import imageio
 import time
+from typing import Tuple
+from datetime import datetime, timezone
+import numpy as np
+import shutil
+from loguru import logger
+import atexit
 
-from directory_cache import DirectoryCache
-from util import format_datetime_for_file, get_host, save_data_to_github
+# change the the imports will work rather than failing mysteriously
+from __init__ import check_path
+check_path() 
 
-class CaptiveBrowser:
+from capture.captive_browser import CaptiveBrowser, are_images_same
+from shared.directory_cache import DirectoryCache
 
-    def __init__(self):
-
-        # use FireFox. Chrome is jittery
-        # https://github.com/mozilla/geckodriver/releases
-        options = webdriver.FirefoxOptions()
-        options.add_argument('--headless')
-        self.driver = webdriver.Firefox(options=options)
-
-        self.driver.set_window_size(1366, 2400)
-        #options = webdriver.ChromeOptions()
-        #options.add_argument('headless')
-        #self.driver = webdriver.Chrome(options=options)
-
-    def get(self, url: str):
-        self.driver.get(url)
-    
-    def wait(self, secs: int, wait_for: Callable = None):
-        w = WebDriverWait(self.driver, secs)
-        if wait_for != None:
-            w.until(wait_for)
-
-    def page_source(self):
-        return self.driver.page_source
-
-    def post_to_remote_cache(self, id: str, owner: str, content: bytes):
-        url = f"http://covid19-api.exemplartech.com/cache/{id}?owner={owner}"
-        resp = requests.post(url, data=content, verify=False)
-        if resp.status_code >= 300:
-            logger.error(f"post to cache at {url} failed status={resp.status_code}")
-        return url
-
-    def save_screenshot(self, xpath: str):
-        self.driver.save_screenshot(xpath)
-
-    def close(self):
-        self.driver.close()
-
-# ---------------------------
+from shared.util import get_host
+from shared import util_git
+from shared import udatetime
 
 class SpecializedCapture():
 
-    def __init__(self, temp_dir: str, publish_dir: str):
+    def __init__(self, temp_dir: str, publish_dir: str, driver: CaptiveBrowser = None):
         self.temp_dir = temp_dir
         self.publish_dir = publish_dir
 
@@ -68,12 +29,23 @@ class SpecializedCapture():
         self.cache = DirectoryCache(os.path.join(publish_dir))
 
         self.changed = False
+        self._is_internal_browser = driver is None
+        self._browser: CaptiveBrowser = driver
+
+    def get_browser(self) -> CaptiveBrowser:
+        if self._browser != None: return self._browser
 
         logger.info("  [start captive browser]")
-        self.browser = CaptiveBrowser()
+        self._browser = CaptiveBrowser()
+        atexit.register(self._browser.close)
+        return self._browser
 
     def close(self):
-        self.browser.close()
+        if self._browser and self._is_internal_browser:
+            logger.info("  [stop captive browser]")
+            self._browser.close()
+            atexit.unregister(self._browser.close)
+            self._browser = None
 
     def publish(self):
         if not self.changed: 
@@ -81,28 +53,17 @@ class SpecializedCapture():
         else:
             host = get_host()
             dt = datetime.now(timezone.utc)
-            msg = f"{dt.isoformat()} on {host} - Specialized Capture"
+            msg = f"{udatetime.to_displayformat(dt)} on {host} - Specialized Capture"
+            util_git.push(self.publish_dir, msg)
 
-            save_data_to_github(self.publish_dir, msg)
+    def remove(self, key: str):
+        self.cache.remove(key)
 
-    def are_images_the_same(self, path1: str, path2: str, out_path: str) -> bool:
+        prefix = f"{key}_"
+        for unique_key in self.cache_images.list_files():
+            if unique_key == key or unique_key.starts(prefix): 
+                self.cache_images.remove(unique_key)
 
-        buffer1 = imageio.imread(path1, as_gray=True)
-        buffer2 = imageio.imread(path2, as_gray=True)
-
-        if buffer1.shape != buffer2.shape:
-            return False
-
-        diff = buffer1 - buffer2
-        xmin, xmax = diff.min(), diff.max()
-        if xmin != xmax and xmin != 0 and xmax != 255.0:
-            scale = 255.0 / (xmax - xmin)
-            diff = ((diff - xmin) * scale).astype(np.uint8)
-            h = np.histogram(diff)
-            print(h)
-            imageio.imwrite(out_path, diff, format="jpg")
-            return False
-        return True
 
     def screenshot(self, key: str, label: str, url: str):
 
@@ -116,30 +77,41 @@ class SpecializedCapture():
         xpath_prev = os.path.join(self.temp_dir,  f"{key}_prev.png")
         xpath_diff = os.path.join(self.temp_dir,  f"{key}_diff.png")
 
+        browser = self.get_browser()
+        if browser == None: raise Exception("Could not get browser")
+
         logger.info(f"    1. get content from {url}")
-        self.browser.get(url)
+        if not browser.navigate(url):
+            logger.info("  page timed out -> skip")
         
-        logger.info("    2. sleep for 5 seconds")
+        logger.info(f"    2. wait for 5 seconds")
         time.sleep(5)
 
-        logger.info("    3. save screenshot")
-        self.browser.save_screenshot(xpath_temp)
-    
+        logger.info(f"    3. save screenshot to {xpath}")
+        buffer_new = browser.screenshot(xpath_temp, full_page=True)        
+        if buffer_new is None:
+            logger.error("      *** could not capture image")
+            return
+
         if os.path.exists(xpath):
-            if self.are_images_the_same(xpath, xpath_temp, xpath_diff):
+            buffer_old = imageio.imread(xpath, as_gray=True)
+            is_same, buffer_diff  = are_images_same(buffer_new, buffer_old)
+            if is_same:
                 logger.info("      images are the same -> return")
+                if os.path.exists(xpath_diff): os.remove(xpath_diff)
                 return
             else:
                 logger.warning("      images are different")
                 if os.path.exists(xpath_prev): os.remove(xpath_prev)
                 if os.path.exists(xpath): os.rename(xpath, xpath_prev)
                 os.rename(xpath_temp, xpath)
+                imageio.imwrite(xpath_diff, buffer_diff, format="png")
         else:
             logger.warning("      image is new")
             os.rename(xpath_temp, xpath)
 
         dt = datetime.now(timezone.utc)
-        timestamp = format_datetime_for_file(dt)
+        timestamp = udatetime.to_filenameformat(dt)
         key_image = key + "_" + timestamp + ".png"
 
         logger.info(f"    4. publish unique image {key_image}")
@@ -156,7 +128,7 @@ class SpecializedCapture():
     <html>
     <body>
             <h3>{label}</h3>
-            <div>captured: {dt.isoformat()}</div>
+            <div>captured: {udatetime.to_displayformat(dt)}</div>
             <div>src: <a href='{url}'>{url}</a></div>
             <br />
             <img src='images/{xkey_image}'>
@@ -166,11 +138,8 @@ class SpecializedCapture():
         self.cache.import_file(f"{key}.html", xpath_html)
         self.changed = True
 
-if __name__ == "__main__":
-    temp_dir = "c:\\temp\\public-cache"
-    publish_dir = "C:\\data\\corona19-data-archive\\captive-browser"
+def special_cases(capture: SpecializedCapture):
 
-    capture = SpecializedCapture(temp_dir, publish_dir)
     capture.screenshot("az_tableau", "Arizona Main Page",
         "https://www.azdhs.gov/preparedness/epidemiology-disease-control/infectious-disease-epidemiology/index.php#novel-coronavirus-home"
     )
@@ -187,6 +156,20 @@ if __name__ == "__main__":
     capture.screenshot("va_tableau", "Virginia Tableau Page",
         "https://public.tableau.com/views/VirginiaCOVID-19Dashboard/VirginiaCOVID-19Dashboard?:embed=yes&:display_count=yes&:showVizHome=no&:toolbar=no"    )
 
-    capture.close()
+    # screenshot is noisy
+    #capture.screenshot("mo_power_bi", "Missouri Power BI",
+    #    "https://health.mo.gov/living/healthcondiseases/communicable/novel-coronavirus/"
+    #)
+
+
+if __name__ == "__main__":
+    temp_dir = "c:\\temp\\public-cache"
+    publish_dir = "C:\\data\\corona19-data-archive\\captive-browser"
+
+    capture = SpecializedCapture(temp_dir, publish_dir)
+    try:
+        special_cases(capture)
+    finally:
+        capture.close()
     capture.publish()
 
